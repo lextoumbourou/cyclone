@@ -132,7 +132,7 @@ class HTTPClient(object):
             else:
                 break
 
-        response.error = None
+        response.error = response.code >= 400
         response.headers = dict(response.headers.getAllRawHeaders())
         # HTTP 204 and 304 responses have no body
         # http://www.w3.org/Protocols/rfc2616/rfc2616-sec10.html
