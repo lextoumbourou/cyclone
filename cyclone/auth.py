@@ -452,12 +452,12 @@ class TwitterMixin(OAuthMixin):
     the user; it is required to make requests on behalf of the user later
     with twitter_request().
     """
-    _OAUTH_REQUEST_TOKEN_URL = "http://api.twitter.com/oauth/request_token"
-    _OAUTH_ACCESS_TOKEN_URL = "http://api.twitter.com/oauth/access_token"
-    _OAUTH_AUTHORIZE_URL = "http://api.twitter.com/oauth/authorize"
-    _OAUTH_AUTHENTICATE_URL = "http://api.twitter.com/oauth/authenticate"
+    _OAUTH_REQUEST_TOKEN_URL = "https://api.twitter.com/oauth/request_token"
+    _OAUTH_ACCESS_TOKEN_URL = "https://api.twitter.com/oauth/access_token"
+    _OAUTH_AUTHORIZE_URL = "https://api.twitter.com/oauth/authorize"
+    _OAUTH_AUTHENTICATE_URL = "https://api.twitter.com/oauth/authenticate"
     _OAUTH_NO_CALLBACKS = False
-    _TWITTER_BASE_URL = "http://api.twitter.com/1"
+    _TWITTER_BASE_URL = "https://api.twitter.com/1.1"
 
     def authenticate_redirect(self):
         """Just like authorize_redirect(), but auto-redirects if authorized.
@@ -514,7 +514,6 @@ class TwitterMixin(OAuthMixin):
         else:
             url = self._TWITTER_BASE_URL + path + ".json"
         # Add the OAuth resource request signature if we have credentials
-        url = "http://twitter.com" + path + ".json"
         if access_token:
             all_args = {}
             all_args.update(args)
@@ -532,7 +531,7 @@ class TwitterMixin(OAuthMixin):
             d.addCallback(self.async_callback(self._on_twitter_request,
                           callback))
         else:
-            d = httpclient.fetch(url)
+            d = httpclient.fetch(url, followRedirect=True)
             d.addCallback(self.async_callback(self._on_twitter_request,
                           callback))
 
@@ -554,7 +553,7 @@ class TwitterMixin(OAuthMixin):
     def _oauth_get_user(self, access_token, callback):
         callback = self.async_callback(self._parse_user_response, callback)
         self.twitter_request(
-            "/users/show/" + escape.native_str(access_token["screen_name"]),
+            "/account/verify_credentials",
             access_token=access_token, callback=callback)
 
     def _parse_user_response(self, callback, user):
