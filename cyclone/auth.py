@@ -1024,7 +1024,7 @@ class FacebookGraphMixin(OAuth2Mixin):
         if user is None:
             callback(None)
             return
-        
+
         fieldmap = {}
         for field in fields:
             fieldmap[field] = user.get(field)
@@ -1091,6 +1091,144 @@ class FacebookGraphMixin(OAuth2Mixin):
             return
         callback(escape.json_decode(response.body))
 
+
+class InstagramMixin(OAuth2Mixin):
+    """Instagram authentication using OAuth2."""
+    _OAUTH_ACCESS_TOKEN_URL = "https://api.instagram.com/oauth/access_token"
+    _OAUTH_AUTHORIZE_URL = "https://api.instagram.com/oauth/authorize/?"
+    _OAUTH_NO_CALLBACKS = False
+
+    def get_authenticated_user(self, redirect_uri, client_id, client_secret,
+                              code, callback, extra_fields=None):
+        """Handles the login for the Instagram user, returning a user object.
+
+        Example usage::
+
+            class InstagramLoginHandler(LoginHandler,
+                                            cyclone.auth.InstagramMixin):
+              @cyclone.web.asynchronous
+              def get(self):
+                  if self.get_argument("code", False):
+                      self.get_authenticated_user(
+                        redirect_uri='/auth/instagram/',
+                        client_id=self.settings["instagram_api_key"],
+                        client_secret=self.settings["instagram_secret"],
+                        code=self.get_argument("code"),
+                        callback=self.async_callback(
+                          self._on_login))
+                      return
+                  self.authorize_redirect(
+                        redirect_uri='/auth/instagram/',
+                        client_id=self.settings["instagram_api_key"],
+                        extra_params={"scope": "likes+comments"})
+
+              def _on_login(self, user):
+                logging.error(user)
+                self.finish()
+
+        """
+        args = {
+          "redirect_uri": redirect_uri,
+          "code": code,
+          "client_id": client_id,
+          "client_secret": client_secret,
+          "grant_type": "authorization_code"
+        }
+
+
+        httpclient.fetch(self._OAUTH_ACCESS_TOKEN_URL,
+                postdata=urllib.urlencode(args))\
+        .addCallback(self.async_callback(
+                            self._on_access_token, redirect_uri, client_id,
+                            client_secret, callback))
+
+
+    def _on_access_token(self, redirect_uri, client_id, client_secret,
+                        callback, response):
+        if response.error:
+            log.warning('Instagram auth error: %s' % str(response))
+            callback(None)
+            return
+
+        args = escape.json_decode(response.body)
+        session = {
+            "access_token": args["access_token"],
+            "expires": args.get("expires")
+        }
+
+        self.instagram_request(
+            path="/users/self",
+            callback=self.async_callback(
+                self._on_get_user_info, callback, session),
+            access_token=session["access_token"])
+
+    def _on_get_user_info(self, callback, session, user):
+        if user is None:
+            callback(None)
+            return
+
+        fieldmap = {"access_token": session["access_token"],
+                         "session_expires": session.get("expires")}
+        callback(fieldmap)
+
+
+    def instagram_request(self, path, callback, access_token=None,
+                           post_args=None, **args):
+        """Fetches the given relative API path, e.g., "/btaylor/picture"
+
+        If the request is a POST, post_args should be provided. Query
+        string arguments should be given as keyword arguments.
+
+        An introduction to the Facebook Graph API can be found at
+        http://developers.facebook.com/docs/api
+
+        Many methods require an OAuth access token which you can obtain
+        through authorize_redirect() and get_authenticated_user(). The
+        user returned through that process includes an 'access_token'
+        attribute that can be used to make authenticated requests via
+        this method. Example usage::
+
+            class MainHandler(cyclone.web.RequestHandler,
+                              cyclone.auth.FacebookGraphMixin):
+                @cyclone.web.authenticated
+                @cyclone.web.asynchronous
+                def get(self):
+                    self.facebook_request(
+                        "/me/feed",
+                        post_args={"message": "Posting from my cyclone app!"},
+                        access_token=self.current_user["access_token"],
+                        callback=self.async_callback(self._on_post))
+
+                def _on_post(self, new_entry):
+                    if not new_entry:
+                        # Call failed; perhaps missing permission?
+                        self.authorize_redirect()
+                        return
+                    self.finish("Posted a message!")
+
+        """
+        url = "https://api.instagram.com/v1" + path
+        all_args = {}
+        if access_token:
+            all_args["access_token"] = access_token
+            all_args.update(args)
+
+        if all_args:
+            url += "?" + urllib.urlencode(all_args)
+        callback = self.async_callback(self._on_instagram_request, callback)
+        if post_args is not None:
+            httpclient.fetch(url, method="POST",
+                    body=urllib.urlencode(post_args)).addCallback(callback)
+        else:
+            httpclient.fetch(url).addCallback(callback)
+
+    def _on_instagram_request(self, callback, response):
+        if response.error:
+            log.warning("Error response %s fetching %s", response.error,
+                            response.request.url)
+            callback(None)
+            return
+        callback(escape.json_decode(response.body))
 
 def _oauth_signature(consumer_token, method, url, parameters={}, token=None):
     """Calculates the HMAC-SHA1 OAuth signature for the given request.
