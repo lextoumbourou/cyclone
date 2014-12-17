@@ -1166,9 +1166,8 @@ class InstagramMixin(OAuth2Mixin):
             callback(None)
             return
 
-        user['session'] = sesssion
+        user['session'] = session
         callback(user)
-
 
     def instagram_request(self, path, callback, access_token=None,
                            post_args=None, **args):
