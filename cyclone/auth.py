@@ -1165,9 +1165,8 @@ class InstagramMixin(OAuth2Mixin):
             callback(None)
             return
 
-        fieldmap = {"access_token": session["access_token"],
-                         "session_expires": session.get("expires")}
-        callback(fieldmap)
+        user['session'] = sesssion
+        callback(user)
 
 
     def instagram_request(self, path, callback, access_token=None,
