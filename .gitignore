@@ -7,3 +7,6 @@ dist
 cyclone.egg-info
 dropin.cache
 *DS_Store*
+_trial_temp
+.coverage
+htmlcov
