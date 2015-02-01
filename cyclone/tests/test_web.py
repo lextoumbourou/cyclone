@@ -196,12 +196,8 @@ class RequestHandlerTest(unittest.TestCase):
         self.rh.set_cookie("name", "value", expires_days=5, max_age=55)
         expires = self.rh._new_cookie["name"]['expires']
         self.assertTrue(
-            expires >
-            email.utils.formatdate(
-                calendar.timegm(time.gmtime()),
-                localtime=False,
-                usegmt=True
-            )
+            email.utils.parsedate(expires) >
+            time.gmtime(),
         )
 
     def test_clear_cookie(self):
