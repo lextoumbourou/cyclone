@@ -927,6 +927,7 @@ class FacebookMixin(object):
             return
         try:
             json = escape.json_decode(response.body)
+        except:
             log.msg("Invalid JSON from Facebook: %r" % response.body)
             callback(None)
             return
