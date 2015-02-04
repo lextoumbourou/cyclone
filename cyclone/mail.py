@@ -26,7 +26,7 @@ import types
 import os.path
 
 from cStringIO import StringIO
-from OpenSSL.SSL import SSLv3_METHOD
+from OpenSSL.SSL import OP_NO_SSLv3
 
 from email import Encoders
 from email.MIMEText import MIMEText
@@ -38,6 +38,17 @@ from twisted.internet import reactor
 from twisted.internet.defer import Deferred
 from twisted.internet.ssl import ClientContextFactory
 from twisted.mail.smtp import ESMTPSenderFactory, quoteaddr
+
+
+class ContextFactory(ClientContextFactory):
+
+    """Context factory that disables SSLv3 (POODLE attack)."""
+
+    def getContext(self):
+        """Get the parent context but disable SSLv3."""
+        ctx = ClientContextFactory.getContext(self)
+        ctx.set_options(OP_NO_SSLv3)
+        return ctx
 
 
 class Message(object):
@@ -170,8 +181,7 @@ def sendmail(mailconf, message):
 
     if use_tls:
         port = mailconf.get("port", 587)
-        contextFactory = ClientContextFactory()
-        contextFactory.method = SSLv3_METHOD
+        contextFactory = ContextFactory()
     else:
         port = mailconf.get("port", 25)
         contextFactory = None
