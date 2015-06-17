@@ -1001,7 +1001,7 @@ class FacebookGraphMixin(OAuth2Mixin):
     def _on_access_token(self, redirect_uri, client_id, client_secret,
                         callback, fields, response):
         if response.error:
-            log.warning('Facebook auth error: %s' % str(response))
+            log.msg('Facebook auth error: %s' % str(response))
             callback(None)
             return
 
@@ -1084,7 +1084,7 @@ class FacebookGraphMixin(OAuth2Mixin):
 
     def _on_facebook_request(self, callback, response):
         if response.error:
-            log.warning("Error response %s fetching %s", response.error,
+            log.msg("Error response %s fetching %s", response.error,
                             response.request.url)
             callback(None)
             return
@@ -1145,7 +1145,7 @@ class InstagramMixin(OAuth2Mixin):
     def _on_access_token(self, redirect_uri, client_id, client_secret,
                         callback, response):
         if response.error:
-            log.warning('Instagram auth error: %s' % str(response))
+            log.msg('Instagram auth error: %s' % str(response))
             callback(None)
             return
 
@@ -1223,7 +1223,7 @@ class InstagramMixin(OAuth2Mixin):
 
     def _on_instagram_request(self, callback, response):
         if response.error:
-            log.warning("Error response %s fetching %s", response.error,
+            log.msg("Error response %s fetching %s", response.error,
                             response.request.url)
             callback(None)
             return
