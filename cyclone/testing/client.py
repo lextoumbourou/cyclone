@@ -21,12 +21,14 @@ from twisted.test import proto_helpers
 from twisted.internet.defer import inlineCallbacks, returnValue
 from Cookie import SimpleCookie
 
+
 class DecodingSimpleCookie(SimpleCookie):
     def __init__(self, app, *args, **kwargs):
         self.app = app
 
     def get_secure_cookie(self, name, value=None, max_age_days=31):
-        if value is None:
+
+        if value is None and name in self:
             value = self[name].value
         return decode_signed_value(
             self.app.settings["cookie_secret"],

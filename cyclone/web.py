@@ -532,7 +532,7 @@ class RequestHandler(object):
         d.addCallbacks(self.finish, self._execute_failure)
         return d
 
-    def _insertAdditionalPageElements(self, html):
+    def _insertAdditionalPageElements(self, html): # pragma: no cover
         """Insert the additional JS and CSS added by the modules on the page"""
         js_embed = []
         js_files = []
@@ -693,7 +693,7 @@ class RequestHandler(object):
                     self._status_code, self._headers, chunk, include_footers)
             headers = self._generate_headers()
         else:
-            for transform in self._transforms:
+            for transform in self._transforms:  # pragma: no cover
                 chunk = transform.transform_chunk(chunk, include_footers)
             headers = ""
 

@@ -5,6 +5,7 @@ python:
     - "pypy"
 
 install:
+    - pip install pyopenssl
     - pip install -r cyclone/tests/test_requirements.txt
     - pip install coveralls
 

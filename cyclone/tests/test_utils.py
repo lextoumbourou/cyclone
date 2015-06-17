@@ -106,7 +106,7 @@ class EscapeTest(unittest.TestCase):
 
     def test_convert_entity(self):
         """
-        A bit hacky for now. Gets things convered though.
+        A bit hacky for now. Gets things covered though.
         """
         m = Mock()
         _convert_entity(m)
