@@ -927,7 +927,7 @@ class FacebookMixin(object):
             return
         try:
             json = escape.json_decode(response.body)
-        except:
+        except Exception:
             log.msg("Invalid JSON from Facebook: %r" % response.body)
             callback(None)
             return
@@ -1145,7 +1145,7 @@ class InstagramMixin(OAuth2Mixin):
     def _on_access_token(self, redirect_uri, client_id, client_secret,
                         callback, response):
         if response.error:
-            log.warning('Instagram auth error: %s' % str(response))
+            log.msg('Instagram auth error: %s' % str(response))
             callback(None)
             return
 
@@ -1166,10 +1166,8 @@ class InstagramMixin(OAuth2Mixin):
             callback(None)
             return
 
-        fieldmap = {"access_token": session["access_token"],
-                         "session_expires": session.get("expires")}
-        callback(fieldmap)
-
+        user['session'] = session
+        callback(user)
 
     def instagram_request(self, path, callback, access_token=None,
                            post_args=None, **args):

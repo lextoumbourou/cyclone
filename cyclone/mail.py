@@ -27,6 +27,7 @@ import os.path
 
 from cStringIO import StringIO
 from OpenSSL.SSL import OP_NO_SSLv3
+from OpenSSL.SSL import TLSv1_2_METHOD
 
 from email import Encoders
 from email.MIMEText import MIMEText
