@@ -36,11 +36,15 @@ import hashlib
 from twisted.internet import defer
 from twisted.internet import protocol
 from twisted.internet import reactor
-from twisted.internet import task
 from twisted.protocols import basic
 from twisted.protocols import policies
 from twisted.python import log
 from twisted.python.failure import Failure
+
+try:
+    import hiredis
+except ImportError:
+    hiredis = None
 
 
 class RedisError(Exception):
@@ -80,7 +84,10 @@ def list_or_args(command, keys, args):
     try:
         iter(keys)
         if isinstance(keys, (str, unicode)):
-            raise TypeError
+            keys = [keys]
+            if not oldapi:
+                return keys
+            oldapi = True
     except TypeError:
         oldapi = True
         keys = [keys]
@@ -122,6 +129,7 @@ class MultiBulkStorage(object):
 
 
 class LineReceiver(protocol.Protocol, basic._PauseableMixin):
+    callLater = reactor.callLater
     line_mode = 1
     __buffer = ''
     delimiter = '\r\n'
@@ -171,7 +179,7 @@ class LineReceiver(protocol.Protocol, basic._PauseableMixin):
         self.line_mode = 1
         if extra:
             self.pauseProducing()
-            reactor.callLater(0, self.dataReceived, extra, True)
+            self.callLater(0, self.dataReceived, extra, True)
 
     def setRawMode(self):
         self.line_mode = 0
@@ -189,7 +197,7 @@ class LineReceiver(protocol.Protocol, basic._PauseableMixin):
         return self.transport.loseConnection()
 
 
-class RedisProtocol(LineReceiver, policies.TimeoutMixin):
+class BaseRedisProtocol(LineReceiver, policies.TimeoutMixin):
     """
     Redis client protocol.
     """
@@ -208,13 +216,33 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
 
         self.transactions = 0
         self.inTransaction = False
+        self.inMulti = False
         self.unwatch_cc = lambda: ()
         self.commit_cc = lambda: ()
 
         self.script_hashes = set()
 
+        self.pipelining = False
+        self.pipelined_commands = []
+        self.pipelined_replies = []
+
     @defer.inlineCallbacks
     def connectionMade(self):
+        if self.factory.password is not None:
+            try:
+                response = yield self.auth(self.factory.password)
+                if isinstance(response, ResponseError):
+                    raise response
+            except Exception, e:
+                self.factory.continueTrying = False
+                self.transport.loseConnection()
+
+                msg = "Redis error: could not auth: %s" % (str(e))
+                self.factory.connectionError(msg)
+                if self.factory.isLazy:
+                    log.msg(msg)
+                defer.returnValue(None)
+
         if self.factory.dbid is not None:
             try:
                 response = yield self.select(self.factory.dbid)
@@ -336,22 +364,32 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
         """
         el = None
         if data is not None:
+            el = self.tryConvertData(data)
+
+        if self.multi_bulk.pending or self.multi_bulk.items:
+            self.handleMultiBulkElement(el)
+        else:
+            self.replyReceived(el)
+
+    def tryConvertData(self, data):
+        if not isinstance(data, str):
+            return data
+        el = None
+        if self.factory.convertNumbers:
             if data and data[0] in _NUM_FIRST_CHARS:  # Most likely a number
                 try:
                     el = int(data) if data.find('.') == -1 else float(data)
                 except ValueError:
                     pass
 
-            if el is None:
+        if el is None:
+            el = data
+            if self.charset is not None:
                 try:
                     el = data.decode(self.charset)
                 except UnicodeDecodeError:
-                    el = data
-
-        if self.multi_bulk.pending or self.multi_bulk.items:
-            self.handleMultiBulkElement(el)
-        else:
-            self.replyReceived(el)
+                    pass
+        return el
 
     def handleMultiBulkElement(self, element):
         self.multi_bulk.append(element)
@@ -372,26 +410,28 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
             reply = self.multi_bulk.items
             self.multi_bulk = MultiBulkStorage()
 
-            if self.inTransaction and reply is not None: # watch or multi has been called
-                if self.transactions > 0:
-                    self.transactions -= len(reply)      # multi: this must be an exec [commit] reply
-                if self.transactions == 0:
-                    self.commit_cc()
-                if self.inTransaction:                   # watch but no multi: process the reply as usual
-                    f = self.post_proc[1:]
-                    if len(f) == 1 and callable(f[0]):
-                        reply = f[0](reply)
-                else:                                    # multi: this must be an exec reply
-                    tmp = []
-                    for f, v in zip(self.post_proc[1:], reply):
-                        if callable(f):
-                            tmp.append(f(v))
-                        else:
-                            tmp.append(v)
-                        reply = tmp
-                self.post_proc = []
+            reply = self.handleTransactionData(reply)
 
             self.replyReceived(reply)
+
+    def handleTransactionData(self, reply):
+        if self.inTransaction and isinstance(reply, list):
+            # watch or multi has been called
+            if self.transactions > 0:
+                # multi: this must be an exec [commit] reply
+                self.transactions -= len(reply)
+            if self.transactions == 0:
+                self.commit_cc()
+            if not self.inTransaction:  # multi: this must be an exec reply
+                tmp = []
+                for f, v in zip(self.post_proc[1:], reply):
+                    if callable(f):
+                        tmp.append(f(v))
+                    else:
+                        tmp.append(v)
+                    reply = tmp
+            self.post_proc = []
+        return reply
 
     def replyReceived(self, reply):
         """
@@ -410,12 +450,16 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
         if self.connected == 0:
             raise ConnectionError("Not connected")
         else:
+
+            # Build the redis command.
             cmds = []
             cmd_template = "$%s\r\n%s\r\n"
             for s in args:
                 if isinstance(s, str):
                     cmd = s
                 elif isinstance(s, unicode):
+                    if self.charset is None:
+                        raise InvalidData("Encoding charset was not specified")
                     try:
                         cmd = s.encode(self.charset, self.errors)
                     except UnicodeEncodeError, e:
@@ -423,17 +467,31 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
                             "Error encoding unicode value '%s': %s" %
                             (repr(s), e))
                 elif isinstance(s, float):
-                    try:
-                        cmd = format(s, "f")
-                    except NameError:
-                        cmd = "%0.6f" % s
+                    cmd = format(s, "f")
                 else:
                     cmd = str(s)
                 cmds.append(cmd_template % (len(cmd), cmd))
-            self.transport.write("*%s\r\n%s" % (len(cmds), "".join(cmds)))
+            command = "*%s\r\n%s" % (len(cmds), "".join(cmds))
+
+            # When pipelining, buffer this command into our list of
+            # pipelined commands. Otherwise, write the command immediately.
+            if self.pipelining:
+                self.pipelined_commands.append(command)
+            else:
+                self.transport.write(command)
+
+            # Return deferred that will contain the result of this command.
+            # Note: when using pipelining, this deferred will NOT return
+            # until after execute_pipeline is called.
             r = self.replyQueue.get().addCallback(self.handle_reply)
 
-            if self.inTransaction:
+            # When pipelining, we need to keep track of the deferred replies
+            # so that we can wait for them in a DeferredList when
+            # execute_pipeline is called.
+            if self.pipelining:
+                self.pipelined_replies.append(r)
+
+            if self.inMulti:
                 self.post_proc.append(kwargs.get("post_proc"))
             else:
                 if "post_proc" in kwargs:
@@ -492,6 +550,26 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
         Return all the keys matching a given pattern
         """
         return self.execute_command("KEYS", pattern)
+
+    @staticmethod
+    def _build_scan_args(cursor, pattern, count):
+        """
+        Construct arguments list for SCAN, SSCAN, HSCAN, ZSCAN commands
+        """
+        args = [cursor]
+        if pattern is not None:
+            args.extend(("MATCH", pattern))
+        if count is not None:
+            args.extend(("COUNT", count))
+
+        return args
+
+    def scan(self, cursor=0, pattern=None, count=None):
+        """
+        Incrementally iterate the keys in database
+        """
+        args = self._build_scan_args(cursor, pattern, count)
+        return self.execute_command("SCAN", *args)
 
     def randomkey(self):
         """
@@ -567,24 +645,32 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
         """
         return self.execute_command("FLUSHALL")
 
+    def time(self):
+        """
+        Returns the current server time as a two items lists: a Unix timestamp
+        and the amount of microseconds already elapsed in the current second
+        """
+        return self.execute_command("TIME")
+
     # Commands operating on string values
-    def set(self, key, value, preserve=False, getset=False):
+    def set(self, key, value, expire=None, pexpire=None,
+            only_if_not_exists=False, only_if_exists=False):
         """
         Set a key to a string value
         """
-        if preserve:
-            warnings.warn(DeprecationWarning(
-                "preserve option to 'set' is deprecated, "
-                "use redis.setnx() instead"))
-            return self.setnx(key, value)
-
-        if getset:
-            warnings.warn(DeprecationWarning(
-                "getset option to 'set' is deprecated, "
-                "use redis.getset() instead"))
-            return self.getset(key, value)
-
-        return self.execute_command("SET", key, value)
+        args = []
+        if expire is not None:
+            args.extend(("EX", expire))
+        if pexpire is not None:
+            args.extend(("PX", pexpire))
+        if only_if_not_exists and only_if_exists:
+            raise RedisError("only_if_not_exists and only_if_exists "
+                             "cannot be true simultaneously")
+        if only_if_not_exists:
+            args.append("NX")
+        if only_if_exists:
+            args.append("XX")
+        return self.execute_command("SET", key, value, *args)
 
     def get(self, key):
         """
@@ -829,13 +915,13 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
         keys.append(timeout)
         return self.execute_command("BRPOP", *keys)
 
-    def brpoplpush(self, source, destination, timeout = 0):
+    def brpoplpush(self, source, destination, timeout=0):
         """
         Pop a value from a list, push it to another list and return
         it; or block until one is available.
         """
         return self.execute_command("BRPOPLPUSH", source, destination, timeout)
-    
+
     def rpoplpush(self, srckey, dstkey):
         """
         Return and remove (atomically) the last element of the source
@@ -951,6 +1037,10 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
         """
         return self.execute_command("SRANDMEMBER", key)
 
+    def sscan(self, key, cursor=0, pattern=None, count=None):
+        args = self._build_scan_args(cursor, pattern, count)
+        return self.execute_command("SSCAN", key, *args)
+
     # Commands operating on sorted zsets (sorted sets)
     def zadd(self, key, score, member, *args):
         """
@@ -1056,8 +1146,8 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
             r.addCallback(self._handle_withscores)
         return r
 
-    def zrangebyscore(self, key, min='-inf', max='+inf', withscores=False,
-                      offset=None, count=None):
+    def zrangebyscore(self, key, min='-inf', max='+inf',
+                      withscores=False, offset=None, count=None):
         """
         Return all the elements with score >= min and score <= max
         (a range query) from the sorted set
@@ -1065,8 +1155,8 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
         return self._zrangebyscore(key, min, max, withscores, offset,
                                    count, False)
 
-    def zrevrangebyscore(self, key, max='+inf', min='-inf', withscores=False,
-                         offset=None, count=None):
+    def zrevrangebyscore(self, key, max='+inf', min='-inf',
+                         withscores=False, offset=None, count=None):
         """
         ZRANGEBYSCORE in reverse order
         """
@@ -1156,6 +1246,10 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
             pieces.extend(("AGGREGATE", aggregate))
         return self.execute_command(*pieces)
 
+    def zscan(self, key, cursor=0, pattern=None, count=None):
+        args = self._build_scan_args(cursor, pattern, count)
+        return self.execute_command("ZSCAN", key, *args)
+
     # Commands operating on hashes
     def hset(self, key, field, value):
         """
@@ -1244,6 +1338,10 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
         f = lambda d: dict(zip(d[::2], d[1::2]))
         return self.execute_command("HGETALL", key, post_proc=f)
 
+    def hscan(self, key, cursor=0, pattern=None, count=None):
+        args = self._build_scan_args(cursor, pattern, count)
+        return self.execute_command("HSCAN", key, *args)
+
     # Sorting
     def sort(self, key, start=None, end=None, by=None, get=None,
              desc=None, alpha=False, store=None):
@@ -1273,11 +1371,15 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
         return self.execute_command("SORT", *pieces)
 
     def _clear_txstate(self):
-        self.inTransaction = False
+        if self.inTransaction:
+            self.inTransaction = False
+            self.inMulti = False
+            self.factory.connectionQueue.put(self)
 
     def watch(self, keys):
         if not self.inTransaction:
             self.inTransaction = True
+            self.inMulti = False
             self.unwatch_cc = self._clear_txstate
             self.commit_cc = lambda: ()
         if isinstance(keys, (str, unicode)):
@@ -1296,6 +1398,7 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
     # must be executed.
     def multi(self, keys=None):
         self.inTransaction = True
+        self.inMulti = True
         self.unwatch_cc = lambda: ()
         self.commit_cc = self._clear_txstate
         if keys is not None:
@@ -1314,23 +1417,61 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
     def _commit_check(self, response):
         if response is None:
             self.transactions = 0
-            self.inTransaction = False
+            self._clear_txstate()
             raise WatchError("Transaction failed")
         else:
             return response
 
     def commit(self):
-        if self.inTransaction is False:
+        if self.inMulti is False:
             raise RedisError("Not in transaction")
         return self.execute_command("EXEC").addCallback(self._commit_check)
 
     def discard(self):
-        if self.inTransaction is False:
+        if self.inMulti is False:
             raise RedisError("Not in transaction")
         self.post_proc = []
         self.transactions = 0
-        self.inTransaction = False
+        self._clear_txstate()
         return self.execute_command("DISCARD")
+
+    # Returns a proxy that works just like .multi() except that commands
+    # are simply buffered to be written all at once in a pipeline.
+    # http://redis.io/topics/pipelining
+    def pipeline(self):
+
+        # Return a deferred that returns self (rather than simply self) to allow
+        # ConnectionHandler to wrap this method with async connection retrieval.
+        self.pipelining = True
+        self.pipelined_commands = []
+        self.pipelined_replies = []
+        d = defer.Deferred()
+        d.addCallback(lambda x: x)
+        d.callback(self)
+        return d
+
+    @defer.inlineCallbacks
+    def execute_pipeline(self):
+        if not self.pipelining:
+            err = "Not currently pipelining commands, " \
+                  "please use pipeline() first"
+            raise RedisError(err)
+
+        # Flush all the commands at once to redis. Wait for all replies
+        # to come back using a deferred list.
+        try:
+            self.transport.write("".join(self.pipelined_commands))
+            results = yield defer.DeferredList(
+                deferredList=self.pipelined_replies,
+                fireOnOneErrback=True,
+                consumeErrors=True,
+                )
+            defer.returnValue([value for success, value in results])
+
+        finally:
+            self.pipelining = False
+            self.pipelined_commands = []
+            self.pipelined_replies = []
 
     # Publish/Subscribe
     # see the SubscriberProtocol for subscribing to channels
@@ -1434,8 +1575,8 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
         keys_and_args = tuple(keys) + tuple(args)
         r = self.execute_command("EVALSHA",
                                  sha1_hash, n,
-                                *keys_and_args).addErrback(self._evalsha_errback,
-                                                   sha1_hash)
+                                 *keys_and_args)
+        r.addErrback(self._evalsha_errback, sha1_hash)
         if sha1_hash not in self.script_hashes:
             r.addCallback(self._eval_success, sha1_hash)
         return r
@@ -1476,6 +1617,49 @@ class RedisProtocol(LineReceiver, policies.TimeoutMixin):
     def script_load(self, script):
         return self.execute_command("SCRIPT",  "LOAD", script)
 
+    # Redis 2.8.9 HyperLogLog commands
+    def pfadd(self, key, elements, *args):
+        elements = list_or_args("pfadd", elements, args)
+        return self.execute_command("PFADD", key, *elements)
+
+    def pfcount(self, keys, *args):
+        keys = list_or_args("pfcount", keys, args)
+        return self.execute_command("PFCOUNT", *keys)
+
+    def pfmerge(self, destKey, sourceKeys, *args):
+        sourceKeys = list_or_args("pfmerge", sourceKeys, args)
+        return self.execute_command("PFMERGE", destKey, *sourceKeys)
+
+
+class HiredisProtocol(BaseRedisProtocol):
+    def __init__(self, *args, **kwargs):
+        BaseRedisProtocol.__init__(self, *args, **kwargs)
+        self._reader = hiredis.Reader(protocolError=InvalidData,
+                                      replyError=ResponseError)
+
+    def dataReceived(self, data, unpause=False):
+        self.resetTimeout()
+        if data:
+            self._reader.feed(data)
+        res = self._reader.gets()
+        while res is not False:
+            if isinstance(res, basestring):
+                res = self.tryConvertData(res)
+            elif isinstance(res, list):
+                res = map(self.tryConvertData, res)
+            if res == "QUEUED":
+                self.transactions += 1
+            else:
+                res = self.handleTransactionData(res)
+
+            self.replyReceived(res)
+            res = self._reader.gets()
+
+if hiredis is not None:
+    RedisProtocol = HiredisProtocol
+else:
+    RedisProtocol = BaseRedisProtocol
+
 
 class MonitorProtocol(RedisProtocol):
     """
@@ -1506,9 +1690,10 @@ class SubscriberProtocol(RedisProtocol):
         if isinstance(reply, list):
             if reply[-3] == u"message":
                 self.messageReceived(None, *reply[-2:])
+            elif len(reply) > 3 and reply[-4] == u"pmessage":
+                self.messageReceived(*reply[-3:])
             else:
                 self.replyQueue.put(reply[-3:])
-                self.messageReceived(*reply[-3:])
         elif isinstance(reply, Exception):
             self.replyQueue.put(reply)
 
@@ -1538,10 +1723,6 @@ class ConnectionHandler(object):
         self._factory = factory
         self._connected = factory.deferred
 
-    def _wait_pool_cleanup(self, deferred):
-        if self._factory.size == 0:
-            deferred.callback(True)
-
     def disconnect(self):
         self._factory.continueTrying = 0
         for conn in self._factory.pool:
@@ -1550,19 +1731,36 @@ class ConnectionHandler(object):
             except:
                 pass
 
-        d = defer.Deferred()
-        t = task.LoopingCall(self._wait_pool_cleanup, d)
-        d.addCallback(lambda ign: t.stop())
-        t.start(.5)
-        return d
+        return self._factory.waitForEmptyPool()
 
     def __getattr__(self, method):
-        try:
-            return getattr(self._factory.getConnection, method)
-        except Exception, e:
-            d = defer.Deferred()
-            d.errback(e)
-            return lambda *ign: d
+        def wrapper(*args, **kwargs):
+            d = self._factory.getConnection()
+
+            def callback(connection):
+                protocol_method = getattr(connection, method)
+                try:
+                    d = protocol_method(*args, **kwargs)
+                except:
+                    self._factory.connectionQueue.put(connection)
+                    raise
+
+                def put_back(reply):
+                    if not connection.inTransaction:
+                        self._factory.connectionQueue.put(connection)
+                    return reply
+
+                def switch_to_errback(reply):
+                    if isinstance(reply, Exception):
+                        raise reply
+                    return reply
+
+                d.addBoth(put_back)
+                d.addCallback(switch_to_errback)
+                return d
+            d.addCallback(callback)
+            return d
+        return wrapper
 
     def __repr__(self):
         try:
@@ -1674,7 +1872,7 @@ class HashRing(object):
     def get_node(self, key):
         n, i = self.get_node_pos(key)
         return n
-    #self.get_node_pos(key)[0]
+    # self.get_node_pos(key)[0]
 
     def get_node_pos(self, key):
         if len(self.ring) == 0:
@@ -1733,6 +1931,9 @@ class ShardedConnectionHandler(object):
             node = self._ring(key)
 
         return getattr(node, method)(*args, **kwargs)
+
+    def pipeline(self):
+        raise NotImplementedError("Pipelining is not supported across shards")
 
     def __getattr__(self, method):
         if method in ShardedMethods:
@@ -1797,7 +1998,8 @@ class RedisFactory(protocol.ReconnectingClientFactory):
     protocol = RedisProtocol
 
     def __init__(self, uuid, dbid, poolsize, isLazy=False,
-                 handler=ConnectionHandler):
+                 handler=ConnectionHandler, charset="utf-8", password=None,
+                 replyTimeout=None, convertNumbers=True):
         if not isinstance(poolsize, int):
             raise ValueError("Redis poolsize must be an integer, not %s" %
                              repr(poolsize))
@@ -1810,14 +2012,30 @@ class RedisFactory(protocol.ReconnectingClientFactory):
         self.dbid = dbid
         self.poolsize = poolsize
         self.isLazy = isLazy
+        self.charset = charset
+        self.password = password
+        self.replyTimeout = replyTimeout
+        self.convertNumbers = convertNumbers
 
         self.idx = 0
         self.size = 0
         self.pool = []
         self.deferred = defer.Deferred()
         self.handler = handler(self)
+        self.connectionQueue = defer.DeferredQueue()
+        self._waitingForEmptyPool = set()
+
+    def buildProtocol(self, addr):
+        if hasattr(self, 'charset'):
+            p = self.protocol(self.charset)
+        else:
+            p = self.protocol()
+        p.factory = self
+        p.timeOut = self.replyTimeout
+        return p
 
     def addConnection(self, conn):
+        self.connectionQueue.put(conn)
         self.pool.append(conn)
         self.size = len(self.pool)
         if self.deferred:
@@ -1832,26 +2050,44 @@ class RedisFactory(protocol.ReconnectingClientFactory):
             log.msg("Could not remove connection from pool: %s" % str(e))
 
         self.size = len(self.pool)
+        if not self.size and self._waitingForEmptyPool:
+            deferreds = self._waitingForEmptyPool
+            self._waitingForEmptyPool = set()
+            for d in deferreds:
+                d.callback(None)
+
+    def _cancelWaitForEmptyPool(self, deferred):
+        self._waitingForEmptyPool.discard(deferred)
+        deferred.errback(defer.CancelledError())
+
+    def waitForEmptyPool(self):
+        """
+        Returns a Deferred which fires when the pool size has reached 0.
+        """
+        if not self.size:
+            return defer.succeed(None)
+        d = defer.Deferred(self._cancelWaitForEmptyPool)
+        self._waitingForEmptyPool.add(d)
+        return d
 
     def connectionError(self, why):
         if self.deferred:
             self.deferred.errback(ValueError(why))
             self.deferred = None
 
-    @property
-    def getConnection(self):
-        if not self.size:
+    @defer.inlineCallbacks
+    def getConnection(self, put_back=False):
+        if not self.continueTrying and not self.size:
             raise ConnectionError("Not connected")
 
-        n = self.size
-        while n:
-            conn = self.pool[self.idx % self.size]
-            self.idx += 1
-            if conn.inTransaction is False:
-                return conn
-            n -= 1
-
-        raise RedisError("In transaction")
+        while True:
+            conn = yield self.connectionQueue.get()
+            if conn.connected == 0:
+                log.msg('Discarding dead connection.')
+            else:
+                if put_back:
+                    self.connectionQueue.put(conn)
+                defer.returnValue(conn)
 
 
 class SubscriberFactory(RedisFactory):
@@ -1870,12 +2106,15 @@ class MonitorFactory(RedisFactory):
                               handler=handler)
 
 
-def makeConnection(host, port, dbid, poolsize, reconnect, isLazy):
+def makeConnection(host, port, dbid, poolsize, reconnect, isLazy,
+                   charset, password, connectTimeout, replyTimeout,
+                   convertNumbers):
     uuid = "%s:%s" % (host, port)
-    factory = RedisFactory(uuid, dbid, poolsize, isLazy, ConnectionHandler)
+    factory = RedisFactory(uuid, dbid, poolsize, isLazy, ConnectionHandler,
+                           charset, password, replyTimeout, convertNumbers)
     factory.continueTrying = reconnect
     for x in xrange(poolsize):
-        reactor.connectTCP(host, port, factory)
+        reactor.connectTCP(host, port, factory, connectTimeout)
 
     if isLazy:
         return factory.handler
@@ -1883,7 +2122,9 @@ def makeConnection(host, port, dbid, poolsize, reconnect, isLazy):
         return factory.deferred
 
 
-def makeShardedConnection(hosts, dbid, poolsize, reconnect, isLazy):
+def makeShardedConnection(hosts, dbid, poolsize, reconnect, isLazy,
+                          charset, password, connectTimeout, replyTimeout,
+                          convertNumbers):
     err = "Please use a list or tuple of host:port for sharded connections"
     if not isinstance(hosts, (list, tuple)):
         raise ValueError(err)
@@ -1896,7 +2137,9 @@ def makeShardedConnection(hosts, dbid, poolsize, reconnect, isLazy):
         except:
             raise ValueError(err)
 
-        c = makeConnection(host, port, dbid, poolsize, reconnect, isLazy)
+        c = makeConnection(host, port, dbid, poolsize, reconnect, isLazy,
+                           charset, password, connectTimeout, replyTimeout,
+                           convertNumbers)
         connections.append(c)
 
     if isLazy:
@@ -1907,45 +2150,83 @@ def makeShardedConnection(hosts, dbid, poolsize, reconnect, isLazy):
         return deferred
 
 
-def Connection(host="localhost", port=6379, dbid=None, reconnect=True):
-    return makeConnection(host, port, dbid, 1, reconnect, False)
+def Connection(host="localhost", port=6379, dbid=None, reconnect=True,
+               charset="utf-8", password=None,
+               connectTimeout=None, replyTimeout=None, convertNumbers=True):
+    return makeConnection(host, port, dbid, 1, reconnect, False,
+                          charset, password, connectTimeout, replyTimeout,
+                          convertNumbers)
 
 
-def lazyConnection(host="localhost", port=6379, dbid=None, reconnect=True):
-    return makeConnection(host, port, dbid, 1, reconnect, True)
+def lazyConnection(host="localhost", port=6379, dbid=None, reconnect=True,
+                   charset="utf-8", password=None,
+                   connectTimeout=None, replyTimeout=None, convertNumbers=True):
+    return makeConnection(host, port, dbid, 1, reconnect, True,
+                          charset, password, connectTimeout, replyTimeout,
+                          convertNumbers)
 
 
 def ConnectionPool(host="localhost", port=6379, dbid=None,
-                   poolsize=10, reconnect=True):
-    return makeConnection(host, port, dbid, poolsize, reconnect, False)
+                   poolsize=10, reconnect=True, charset="utf-8", password=None,
+                   connectTimeout=None, replyTimeout=None,
+                   convertNumbers=True):
+    return makeConnection(host, port, dbid, poolsize, reconnect, False,
+                          charset, password, connectTimeout, replyTimeout,
+                          convertNumbers)
 
 
 def lazyConnectionPool(host="localhost", port=6379, dbid=None,
-                       poolsize=10, reconnect=True):
-    return makeConnection(host, port, dbid, poolsize, reconnect, True)
+                       poolsize=10, reconnect=True, charset="utf-8",
+                       password=None, connectTimeout=None, replyTimeout=None,
+                       convertNumbers=True):
+    return makeConnection(host, port, dbid, poolsize, reconnect, True,
+                          charset, password, connectTimeout, replyTimeout,
+                          convertNumbers)
 
 
-def ShardedConnection(hosts, dbid=None, reconnect=True):
-    return makeShardedConnection(hosts, dbid, 1, reconnect, False)
+def ShardedConnection(hosts, dbid=None, reconnect=True, charset="utf-8",
+                      password=None, connectTimeout=None, replyTimeout=None,
+                      convertNumbers=True):
+    return makeShardedConnection(hosts, dbid, 1, reconnect, False,
+                                 charset, password, connectTimeout,
+                                 replyTimeout, convertNumbers)
 
 
-def lazyShardedConnection(hosts, dbid=None, reconnect=True):
-    return makeShardedConnection(hosts, dbid, 1, reconnect, True)
+def lazyShardedConnection(hosts, dbid=None, reconnect=True, charset="utf-8",
+                          password=None,
+                          connectTimeout=None, replyTimeout=None,
+                          convertNumbers=True):
+    return makeShardedConnection(hosts, dbid, 1, reconnect, True,
+                                 charset, password, connectTimeout,
+                                 replyTimeout, convertNumbers)
 
 
-def ShardedConnectionPool(hosts, dbid=None, poolsize=10, reconnect=True):
-    return makeShardedConnection(hosts, dbid, poolsize, reconnect, False)
+def ShardedConnectionPool(hosts, dbid=None, poolsize=10, reconnect=True,
+                          charset="utf-8", password=None,
+                          connectTimeout=None, replyTimeout=None,
+                          convertNumbers=True):
+    return makeShardedConnection(hosts, dbid, poolsize, reconnect, False,
+                                 charset, password, connectTimeout,
+                                 replyTimeout, convertNumbers)
 
 
-def lazyShardedConnectionPool(hosts, dbid=None, poolsize=10, reconnect=True):
-    return makeShardedConnection(hosts, dbid, poolsize, reconnect, True)
+def lazyShardedConnectionPool(hosts, dbid=None, poolsize=10, reconnect=True,
+                              charset="utf-8", password=None,
+                              connectTimeout=None, replyTimeout=None,
+                              convertNumbers=True):
+    return makeShardedConnection(hosts, dbid, poolsize, reconnect, True,
+                                 charset, password, connectTimeout,
+                                 replyTimeout, convertNumbers)
 
 
-def makeUnixConnection(path, dbid, poolsize, reconnect, isLazy):
-    factory = RedisFactory(path, dbid, poolsize, isLazy, UnixConnectionHandler)
+def makeUnixConnection(path, dbid, poolsize, reconnect, isLazy,
+                       charset, password, connectTimeout, replyTimeout,
+                       convertNumbers):
+    factory = RedisFactory(path, dbid, poolsize, isLazy, UnixConnectionHandler,
+                           charset, password, replyTimeout, convertNumbers)
     factory.continueTrying = reconnect
     for x in xrange(poolsize):
-        reactor.connectUNIX(path, factory)
+        reactor.connectUNIX(path, factory, connectTimeout)
 
     if isLazy:
         return factory.handler
@@ -1953,14 +2234,18 @@ def makeUnixConnection(path, dbid, poolsize, reconnect, isLazy):
         return factory.deferred
 
 
-def makeShardedUnixConnection(paths, dbid, poolsize, reconnect, isLazy):
+def makeShardedUnixConnection(paths, dbid, poolsize, reconnect, isLazy,
+                              charset, password, connectTimeout, replyTimeout,
+                              convertNumbers):
     err = "Please use a list or tuple of paths for sharded unix connections"
     if not isinstance(paths, (list, tuple)):
         raise ValueError(err)
 
     connections = []
     for path in paths:
-        c = makeUnixConnection(path, dbid, poolsize, reconnect, isLazy)
+        c = makeUnixConnection(path, dbid, poolsize, reconnect, isLazy,
+                               charset, password, connectTimeout, replyTimeout,
+                               convertNumbers)
         connections.append(c)
 
     if isLazy:
@@ -1971,39 +2256,74 @@ def makeShardedUnixConnection(paths, dbid, poolsize, reconnect, isLazy):
         return deferred
 
 
-def UnixConnection(path="/tmp/redis.sock", dbid=None, reconnect=True):
-    return makeUnixConnection(path, dbid, 1, reconnect, False)
+def UnixConnection(path="/tmp/redis.sock", dbid=None, reconnect=True,
+                   charset="utf-8", password=None,
+                   connectTimeout=None, replyTimeout=None, convertNumbers=True):
+    return makeUnixConnection(path, dbid, 1, reconnect, False,
+                              charset, password, connectTimeout, replyTimeout,
+                              convertNumbers)
 
 
-def lazyUnixConnection(path="/tmp/redis.sock", dbid=None, reconnect=True):
-    return makeUnixConnection(path, dbid, 1, reconnect, True)
+def lazyUnixConnection(path="/tmp/redis.sock", dbid=None, reconnect=True,
+                       charset="utf-8", password=None,
+                       connectTimeout=None, replyTimeout=None,
+                       convertNumbers=True):
+    return makeUnixConnection(path, dbid, 1, reconnect, True,
+                              charset, password, connectTimeout, replyTimeout,
+                              convertNumbers)
 
 
 def UnixConnectionPool(path="/tmp/redis.sock", dbid=None, poolsize=10,
-                       reconnect=True):
-    return makeUnixConnection(path, dbid, poolsize, reconnect, False)
+                       reconnect=True, charset="utf-8", password=None,
+                       connectTimeout=None, replyTimeout=None,
+                       convertNumbers=True):
+    return makeUnixConnection(path, dbid, poolsize, reconnect, False,
+                              charset, password, connectTimeout, replyTimeout,
+                              convertNumbers)
 
 
 def lazyUnixConnectionPool(path="/tmp/redis.sock", dbid=None, poolsize=10,
-                           reconnect=True):
-    return makeUnixConnection(path, dbid, poolsize, reconnect, True)
+                           reconnect=True, charset="utf-8", password=None,
+                           connectTimeout=None, replyTimeout=None,
+                           convertNumbers=True):
+    return makeUnixConnection(path, dbid, poolsize, reconnect, True,
+                              charset, password, connectTimeout, replyTimeout,
+                              convertNumbers)
 
 
-def ShardedUnixConnection(paths, dbid=None, reconnect=True):
-    return makeShardedUnixConnection(paths, dbid, 1, reconnect, False)
+def ShardedUnixConnection(paths, dbid=None, reconnect=True, charset="utf-8",
+                          password=None, connectTimeout=None, replyTimeout=None,
+                          convertNumbers=True):
+    return makeShardedUnixConnection(paths, dbid, 1, reconnect, False,
+                                     charset, password, connectTimeout,
+                                     replyTimeout, convertNumbers)
 
 
-def lazyShardedUnixConnection(paths, dbid=None, reconnect=True):
-    return makeShardedUnixConnection(paths, dbid, 1, reconnect, True)
+def lazyShardedUnixConnection(paths, dbid=None, reconnect=True,
+                              charset="utf-8", password=None,
+                              connectTimeout=None, replyTimeout=None,
+                              convertNumbers=True):
+    return makeShardedUnixConnection(paths, dbid, 1, reconnect, True,
+                                     charset, password, connectTimeout,
+                                     replyTimeout, convertNumbers)
 
 
-def ShardedUnixConnectionPool(paths, dbid=None, poolsize=10, reconnect=True):
-    return makeShardedUnixConnection(paths, dbid, poolsize, reconnect, False)
+def ShardedUnixConnectionPool(paths, dbid=None, poolsize=10, reconnect=True,
+                              charset="utf-8", password=None,
+                              connectTimeout=None, replyTimeout=None,
+                              convertNumbers=True):
+    return makeShardedUnixConnection(paths, dbid, poolsize, reconnect, False,
+                                     charset, password, connectTimeout,
+                                     replyTimeout, convertNumbers)
 
 
 def lazyShardedUnixConnectionPool(paths, dbid=None, poolsize=10,
-                                  reconnect=True):
-    return makeShardedUnixConnection(paths, dbid, poolsize, reconnect, True)
+                                  reconnect=True, charset="utf-8",
+                                  password=None, connectTimeout=None,
+                                  replyTimeout=None, convertNumbers=True):
+    return makeShardedUnixConnection(paths, dbid, poolsize, reconnect, True,
+                                     charset, password, connectTimeout,
+                                     replyTimeout, convertNumbers)
 
 
 __all__ = [
